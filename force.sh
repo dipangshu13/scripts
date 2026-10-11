@@ -4,7 +4,7 @@
 # Brute-forces a btrfs UUID_SUB that starts with PREFIX and contains none
 # of the chars in EXCLUDE, then writes the winning filesystem to REAL_DEV.
 #
-# Requires (root): mkfs.btrfs, losetup, dd, od, blkid, truncate, flock, grep
+# Requires (root): mkfs.btrfs, losetup, dd, od, blkid, truncate, grep
 # WARNING: REAL_DEV is COMPLETELY OVERWRITTEN.
 
 set -euo pipefail
@@ -23,8 +23,6 @@ WORKDIR="${WORKDIR:-/dev/shm/btrfs-uuid-bf}"
 LOG_EVERY="${LOG_EVERY:-5000}"
 # Print a global heartbeat every N seconds
 HEARTBEAT_EVERY="${HEARTBEAT_EVERY:-5}"
-# Loop device reset interval (avoids kernel "device busy" quirk)
-RESET_EVERY="${RESET_EVERY:-50}"
 
 # btrfs on-disk offsets
 SB_OFF=0x10000
@@ -32,7 +30,7 @@ SB_UUID_SUB_OFF=$((SB_OFF + 0x40))
 
 # ---------------- Sanity ----------------
 [ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
-for c in mkfs.btrfs losetup dd od blkid truncate flock grep; do
+for c in mkfs.btrfs losetup dd od blkid truncate grep; do
     command -v "$c" >/dev/null || { echo "missing: $c" >&2; exit 1; }
 done
 [ -b "$REAL_DEV" ] || { echo "not a block device: $REAL_DEV" >&2; exit 1; }
@@ -128,38 +126,18 @@ log ""
 worker() {
     local id="$1"
     local img="$WORKDIR/bf_$id.img"
-    local dev lockfile="$WORKDIR/.losetup.lock"
 
     truncate -s "$SIZE" "$img"
 
-    # Allocate a unique loop device under a global lock.
-    {
-        flock -x 9
-        dev="$(losetup -f 2>/dev/null || true)"
-    } 9>"$lockfile"
-    [ -n "$dev" ] || { log "[worker $id] could not get loop dev"; return 1; }
-
-    # Attach ONCE. Reused every iteration.
-    if ! losetup "$dev" "$img" 2>/dev/null; then
-        log "[worker $id] losetup attach failed on $dev"
-        return 1
-    fi
-    # shellcheck disable=SC2064
-    trap "losetup -d '$dev' 2>/dev/null || true; exit 1" TERM INT HUP
-
-    local i=0 h uuid fail=0
+    local i=0 h uuid fail=0 dev
     while [ "$KEEP_RUNNING" -eq 1 ] && ! claimed; do
         i=$((i+1))
 
-        # Periodic loop reset to avoid the "device busy" kernel quirk.
-        if [ $((i % RESET_EVERY)) -eq 0 ]; then
-            losetup -d "$dev" 2>/dev/null || true
-            sleep 0.02
-            losetup "$dev" "$img" 2>/dev/null || {
-                sleep 0.1
-                losetup "$dev" "$img" 2>/dev/null || continue
-            }
-        fi
+        # Fresh loop device every iteration — never reuse, never gets busy.
+        dev="$(losetup -f --show "$img" 2>/dev/null)" || {
+            sleep 0.05
+            continue
+        }
 
         if ! mkfs.btrfs -f -q "$dev" -L "$LABEL" -U "$MAIN_UUID" \
                 2>"$WORKDIR/mkfs.err.$id"; then
@@ -168,20 +146,19 @@ worker() {
                 log "[worker $id] mkfs failed (attempt $i, fail #$fail):"
                 sed 's/^/    /' "$WORKDIR/mkfs.err.$id" >&2
             fi
-            # On busy, force a loop reset next iteration.
-            if grep -q "Device or resource busy" "$WORKDIR/mkfs.err.$id"; then
-                losetup -d "$dev" 2>/dev/null || true
-                sleep 0.05
-                losetup "$dev" "$img" 2>/dev/null || true
-            fi
-            sleep 0.05
+            rm -f "$WORKDIR/mkfs.err.$id"
+            losetup -d "$dev" 2>/dev/null || true
+            sleep 0.02
             continue
         fi
         rm -f "$WORKDIR/mkfs.err.$id"
         fail=0
 
         h="$(read_uuid_sub_hex "$dev")" || true
-        [ "${#h}" -eq 32 ] || continue
+        if [ "${#h}" -ne 32 ]; then
+            losetup -d "$dev" 2>/dev/null || true
+            continue
+        fi
 
         if [ $((i % LOG_EVERY)) -eq 0 ]; then
             uuid="$(hex_to_uuid "$h")"
@@ -196,11 +173,12 @@ worker() {
                 log "    UUID_SUB = $uuid"
                 printf '%s\n' "$img" > "$WIN_PATH"
             fi
+            losetup -d "$dev" 2>/dev/null || true
             break
         fi
-    done
 
-    losetup -d "$dev" 2>/dev/null || true
+        losetup -d "$dev" 2>/dev/null || true
+    done
 }
 
 # ---------------- Heartbeat ----------------
