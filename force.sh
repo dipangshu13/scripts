@@ -4,7 +4,7 @@
 # Brute-forces a btrfs UUID_SUB that starts with PREFIX and contains none
 # of the chars in EXCLUDE, then writes the winning filesystem to REAL_DEV.
 #
-# Requires (root): mkfs.btrfs, losetup, dd, od, blkid, truncate, flock
+# Requires (root): mkfs.btrfs, losetup, dd, od, blkid, truncate, flock, grep
 # WARNING: REAL_DEV is COMPLETELY OVERWRITTEN.
 
 set -euo pipefail
@@ -23,6 +23,8 @@ WORKDIR="${WORKDIR:-/dev/shm/btrfs-uuid-bf}"
 LOG_EVERY="${LOG_EVERY:-5000}"
 # Print a global heartbeat every N seconds
 HEARTBEAT_EVERY="${HEARTBEAT_EVERY:-5}"
+# Loop device reset interval (avoids kernel "device busy" quirk)
+RESET_EVERY="${RESET_EVERY:-50}"
 
 # btrfs on-disk offsets
 SB_OFF=0x10000
@@ -30,7 +32,7 @@ SB_UUID_SUB_OFF=$((SB_OFF + 0x40))
 
 # ---------------- Sanity ----------------
 [ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
-for c in mkfs.btrfs losetup dd od blkid truncate flock; do
+for c in mkfs.btrfs losetup dd od blkid truncate flock grep; do
     command -v "$c" >/dev/null || { echo "missing: $c" >&2; exit 1; }
 done
 [ -b "$REAL_DEV" ] || { echo "not a block device: $REAL_DEV" >&2; exit 1; }
@@ -137,7 +139,7 @@ worker() {
     } 9>"$lockfile"
     [ -n "$dev" ] || { log "[worker $id] could not get loop dev"; return 1; }
 
-    # Attach ONCE. Reuse the same attached device every iteration.
+    # Attach ONCE. Reused every iteration.
     if ! losetup "$dev" "$img" 2>/dev/null; then
         log "[worker $id] losetup attach failed on $dev"
         return 1
@@ -149,14 +151,28 @@ worker() {
     while [ "$KEEP_RUNNING" -eq 1 ] && ! claimed; do
         i=$((i+1))
 
+        # Periodic loop reset to avoid the "device busy" kernel quirk.
+        if [ $((i % RESET_EVERY)) -eq 0 ]; then
+            losetup -d "$dev" 2>/dev/null || true
+            sleep 0.02
+            losetup "$dev" "$img" 2>/dev/null || {
+                sleep 0.1
+                losetup "$dev" "$img" 2>/dev/null || continue
+            }
+        fi
+
         if ! mkfs.btrfs -f -q "$dev" -L "$LABEL" -U "$MAIN_UUID" \
                 2>"$WORKDIR/mkfs.err.$id"; then
             fail=$((fail+1))
             if [ "$fail" -le 3 ]; then
                 log "[worker $id] mkfs failed (attempt $i, fail #$fail):"
                 sed 's/^/    /' "$WORKDIR/mkfs.err.$id" >&2
-            elif [ $((fail % 200)) -eq 0 ]; then
-                log "[worker $id] still failing (fail #$fail)"
+            fi
+            # On busy, force a loop reset next iteration.
+            if grep -q "Device or resource busy" "$WORKDIR/mkfs.err.$id"; then
+                losetup -d "$dev" 2>/dev/null || true
+                sleep 0.05
+                losetup "$dev" "$img" 2>/dev/null || true
             fi
             sleep 0.05
             continue
@@ -165,9 +181,7 @@ worker() {
         fail=0
 
         h="$(read_uuid_sub_hex "$dev")" || true
-        if [ "${#h}" -ne 32 ]; then
-            continue
-        fi
+        [ "${#h}" -eq 32 ] || continue
 
         if [ $((i % LOG_EVERY)) -eq 0 ]; then
             uuid="$(hex_to_uuid "$h")"
