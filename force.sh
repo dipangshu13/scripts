@@ -15,7 +15,7 @@ LABEL="${LABEL:-/}"
 MAIN_UUID="${MAIN_UUID:-0dd13410-013a-013b-013c-1341000000f4}"
 PREFIX="${PREFIX:-0dd}"
 EXCLUDE="${EXCLUDE:-f5}"
-SIZE="${SIZE:-128M}"
+SIZE="${SIZE:-1G}"
 WORKERS="${WORKERS:-$(nproc)}"
 WORKDIR="${WORKDIR:-/dev/shm/btrfs-uuid-bf}"
 
@@ -47,11 +47,8 @@ cleanup() {
     [ "$KEEP_RUNNING" -eq 0 ] && return
     echo "" >&2
     echo ">>> Shutting down (killing workers, detaching loops)..." >&2
-    # Kill all direct background children
     jobs -p 2>/dev/null | xargs -r kill -9 2>/dev/null || true
-    # Belt and braces: kill anything matching our scratch dir
     pkill -9 -f "btrfs-uuid-bf" 2>/dev/null || true
-    # Detach any loop devices pointing at our images
     if [ -n "${WORKDIR:-}" ]; then
         while IFS=: read -r d _; do
             [ -n "$d" ] && losetup -d "$d" 2>/dev/null || true
@@ -63,7 +60,6 @@ cleanup() {
 trap cleanup INT TERM
 
 # ---------------- Helpers ----------------
-# Read UUID_SUB from the raw btrfs superblock as 32-char lowercase hex.
 read_uuid_sub_hex() {
     local dev="$1"
     dd if="$dev" bs=1 skip="$SB_UUID_SUB_OFF" count=16 \
@@ -71,7 +67,6 @@ read_uuid_sub_hex() {
     | od -An -tx1 | tr -d ' \n'
 }
 
-# Accept if first len(PREFIX) nibbles == PREFIX and no nibble is in EXCLUDE.
 accept_hex() {
     local h="$1" c i
     [ "${h:0:${#PREFIX}}" = "$PREFIX" ] || return 1
@@ -140,10 +135,13 @@ worker() {
         flock -x 9
         dev="$(losetup -f 2>/dev/null || true)"
     } 9>"$lockfile"
-
     [ -n "$dev" ] || { log "[worker $id] could not get loop dev"; return 1; }
 
-    # Clean up loop device on any exit from this worker.
+    # Attach ONCE. Reuse the same attached device every iteration.
+    if ! losetup "$dev" "$img" 2>/dev/null; then
+        log "[worker $id] losetup attach failed on $dev"
+        return 1
+    fi
     # shellcheck disable=SC2064
     trap "losetup -d '$dev' 2>/dev/null || true; exit 1" TERM INT HUP
 
@@ -151,24 +149,15 @@ worker() {
     while [ "$KEEP_RUNNING" -eq 1 ] && ! claimed; do
         i=$((i+1))
 
-        # Fresh attach each iteration to avoid stale superblock state.
-        losetup -d "$dev" 2>/dev/null || true
-        if ! losetup "$dev" "$img" 2>/dev/null; then
-            sleep 0.05
-            continue
-        fi
-
         if ! mkfs.btrfs -f -q "$dev" -L "$LABEL" -U "$MAIN_UUID" \
                 2>"$WORKDIR/mkfs.err.$id"; then
             fail=$((fail+1))
-            # Only flood once per worker so you can see it's alive but quiet.
             if [ "$fail" -le 3 ]; then
                 log "[worker $id] mkfs failed (attempt $i, fail #$fail):"
                 sed 's/^/    /' "$WORKDIR/mkfs.err.$id" >&2
             elif [ $((fail % 200)) -eq 0 ]; then
                 log "[worker $id] still failing (fail #$fail)"
             fi
-            losetup -d "$dev" 2>/dev/null || true
             sleep 0.05
             continue
         fi
@@ -177,7 +166,6 @@ worker() {
 
         h="$(read_uuid_sub_hex "$dev")" || true
         if [ "${#h}" -ne 32 ]; then
-            losetup -d "$dev" 2>/dev/null || true
             continue
         fi
 
@@ -196,8 +184,6 @@ worker() {
             fi
             break
         fi
-
-        losetup -d "$dev" 2>/dev/null || true
     done
 
     losetup -d "$dev" 2>/dev/null || true
