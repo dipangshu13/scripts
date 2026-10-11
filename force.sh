@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# btrfs-uuid-sub-bruteforce.sh  (verbose / NixOS-safe)
+# btrfs-uuid-sub-bruteforce.sh
 #
-# Brute-forces a btrfs UUID_SUB. Prints live progress.
+# Brute-forces a btrfs UUID_SUB that starts with PREFIX and contains none
+# of the chars in EXCLUDE, then writes the winning filesystem to REAL_DEV.
+#
+# Requires (root): mkfs.btrfs, losetup, dd, od, blkid, truncate, flock
+# WARNING: REAL_DEV is COMPLETELY OVERWRITTEN.
 
 set -euo pipefail
 
-# ---------- Config (override via env) ----------
+# ---------------- Config (override via env) ----------------
 REAL_DEV="${REAL_DEV:-/dev/nvme0n1p4}"
 LABEL="${LABEL:-/}"
 MAIN_UUID="${MAIN_UUID:-0dd13410-013a-013b-013c-1341000000f4}"
@@ -15,26 +19,51 @@ SIZE="${SIZE:-128M}"
 WORKERS="${WORKERS:-$(nproc)}"
 WORKDIR="${WORKDIR:-/dev/shm/btrfs-uuid-bf}"
 
-# How often each worker prints progress (attempts)
-LOG_EVERY="${LOG_EVERY:-2000}"
+# Print a per-worker progress line every N attempts
+LOG_EVERY="${LOG_EVERY:-5000}"
+# Print a global heartbeat every N seconds
+HEARTBEAT_EVERY="${HEARTBEAT_EVERY:-5}"
 
 # btrfs on-disk offsets
 SB_OFF=0x10000
 SB_UUID_SUB_OFF=$((SB_OFF + 0x40))
 
-# ---------- Sanity ----------
+# ---------------- Sanity ----------------
 [ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
-for c in mkfs.btrfs losetup dd od blkid truncate; do
+for c in mkfs.btrfs losetup dd od blkid truncate flock; do
     command -v "$c" >/dev/null || { echo "missing: $c" >&2; exit 1; }
 done
 [ -b "$REAL_DEV" ] || { echo "not a block device: $REAL_DEV" >&2; exit 1; }
 
 mkdir -p "$WORKDIR"
 
-# ---------- Helpers ----------
+# ---------------- Logging ----------------
 log() { printf '%s\n' "$*" >&2; }
 
-# Read UUID_SUB from raw superblock as 32-char hex (od, no xxd needed)
+# ---------------- Cleanup / Ctrl+C ----------------
+KEEP_RUNNING=1
+cleanup() {
+    trap - INT TERM EXIT
+    [ "$KEEP_RUNNING" -eq 0 ] && return
+    echo "" >&2
+    echo ">>> Shutting down (killing workers, detaching loops)..." >&2
+    # Kill all direct background children
+    jobs -p 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    # Belt and braces: kill anything matching our scratch dir
+    pkill -9 -f "btrfs-uuid-bf" 2>/dev/null || true
+    # Detach any loop devices pointing at our images
+    if [ -n "${WORKDIR:-}" ]; then
+        while IFS=: read -r d _; do
+            [ -n "$d" ] && losetup -d "$d" 2>/dev/null || true
+        done < <(losetup -a 2>/dev/null | grep "$WORKDIR" || true)
+    fi
+    echo ">>> Done." >&2
+    exit 130
+}
+trap cleanup INT TERM
+
+# ---------------- Helpers ----------------
+# Read UUID_SUB from the raw btrfs superblock as 32-char lowercase hex.
 read_uuid_sub_hex() {
     local dev="$1"
     dd if="$dev" bs=1 skip="$SB_UUID_SUB_OFF" count=16 \
@@ -42,6 +71,7 @@ read_uuid_sub_hex() {
     | od -An -tx1 | tr -d ' \n'
 }
 
+# Accept if first len(PREFIX) nibbles == PREFIX and no nibble is in EXCLUDE.
 accept_hex() {
     local h="$1" c i
     [ "${h:0:${#PREFIX}}" = "$PREFIX" ] || return 1
@@ -58,16 +88,14 @@ hex_to_uuid() {
         "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
 }
 
-# ---------- Shared state ----------
+# ---------------- Shared state ----------------
 WIN_LOCK="$WORKDIR/.win.lock"
 WIN_PATH="$WORKDIR/.win.path"
-TOTAL_FILE="$WORKDIR/.total"      # atomic-ish attempt counter
 rm -rf "$WIN_LOCK" "$WIN_PATH"
-echo 0 > "$TOTAL_FILE"
 
 claimed() { [ -d "$WIN_LOCK" ]; }
 
-# ---------- Pre-flight check ----------
+# ---------------- Pre-flight ----------------
 log "=== Pre-flight ==="
 log "target     : $REAL_DEV"
 log "label      : $LABEL"
@@ -83,16 +111,15 @@ log "Testing a single mkfs cycle..."
 TEST_IMG="$WORKDIR/.test.img"
 truncate -s "$SIZE" "$TEST_IMG"
 TEST_DEV="$(losetup -f --show "$TEST_IMG")"
-if mkfs.btrfs -f -q "$TEST_DEV" -L "$LABEL" -U "$MAIN_UUID" 2>&1; then
+if mkfs.btrfs -f -q "$TEST_DEV" -L "$LABEL" -U "$MAIN_UUID" 2>/dev/null; then
     TEST_SUB="$(read_uuid_sub_hex "$TEST_DEV")"
     log "ok — sample UUID_SUB hex = $TEST_SUB"
-    [ "${#TEST_SUB}" -eq 32 ] || {
+    if [ "${#TEST_SUB}" -ne 32 ]; then
         log "ERROR: raw read returned ${#TEST_SUB} chars, expected 32."
-        log "Check the SB offset or byte order."
         losetup -d "$TEST_DEV"; rm -f "$TEST_IMG"; exit 1
-    }
+    fi
 else
-    log "ERROR: mkfs.btrfs failed on the loop device (see above)."
+    log "ERROR: mkfs.btrfs failed on the loop device."
     losetup -d "$TEST_DEV"; rm -f "$TEST_IMG"; exit 1
 fi
 losetup -d "$TEST_DEV"
@@ -100,39 +127,61 @@ rm -f "$TEST_IMG"
 log "Pre-flight OK. Starting $WORKERS workers..."
 log ""
 
-# ---------- Worker ----------
+# ---------------- Worker ----------------
 worker() {
     local id="$1"
     local img="$WORKDIR/bf_$id.img"
-    local dev
+    local dev lockfile="$WORKDIR/.losetup.lock"
 
     truncate -s "$SIZE" "$img"
-    dev="$(losetup -f --show "$img")"
-    # shellcheck disable=SC2064
-    trap "losetup -d '$dev' 2>/dev/null || true" EXIT
 
-    local i=0 h uuid
-    while ! claimed; do
+    # Allocate a unique loop device under a global lock.
+    {
+        flock -x 9
+        dev="$(losetup -f 2>/dev/null || true)"
+    } 9>"$lockfile"
+
+    [ -n "$dev" ] || { log "[worker $id] could not get loop dev"; return 1; }
+
+    # Clean up loop device on any exit from this worker.
+    # shellcheck disable=SC2064
+    trap "losetup -d '$dev' 2>/dev/null || true; exit 1" TERM INT HUP
+
+    local i=0 h uuid fail=0
+    while [ "$KEEP_RUNNING" -eq 1 ] && ! claimed; do
         i=$((i+1))
 
-        # mkfs — log first failure to help debugging
-        if ! mkfs.btrfs -f -q "$dev" -L "$LABEL" -U "$MAIN_UUID" 2>"$WORKDIR/mkfs.err.$id"; then
-            log "[worker $id] mkfs FAILED on attempt $i:"
-            sed 's/^/    /' "$WORKDIR/mkfs.err.$id" >&2
-            rm -f "$WORKDIR/mkfs.err.$id"
-            sleep 1
+        # Fresh attach each iteration to avoid stale superblock state.
+        losetup -d "$dev" 2>/dev/null || true
+        if ! losetup "$dev" "$img" 2>/dev/null; then
+            sleep 0.05
+            continue
+        fi
+
+        if ! mkfs.btrfs -f -q "$dev" -L "$LABEL" -U "$MAIN_UUID" \
+                2>"$WORKDIR/mkfs.err.$id"; then
+            fail=$((fail+1))
+            # Only flood once per worker so you can see it's alive but quiet.
+            if [ "$fail" -le 3 ]; then
+                log "[worker $id] mkfs failed (attempt $i, fail #$fail):"
+                sed 's/^/    /' "$WORKDIR/mkfs.err.$id" >&2
+            elif [ $((fail % 200)) -eq 0 ]; then
+                log "[worker $id] still failing (fail #$fail)"
+            fi
+            losetup -d "$dev" 2>/dev/null || true
+            sleep 0.05
             continue
         fi
         rm -f "$WORKDIR/mkfs.err.$id"
+        fail=0
 
         h="$(read_uuid_sub_hex "$dev")" || true
-        [ "${#h}" -eq 32 ] || {
-            log "[worker $id] bad raw read (${#h} chars): '$h'"
+        if [ "${#h}" -ne 32 ]; then
+            losetup -d "$dev" 2>/dev/null || true
             continue
-        }
+        fi
 
-        # progress line
-        if (( i % LOG_EVERY == 0 )); then
+        if [ $((i % LOG_EVERY)) -eq 0 ]; then
             uuid="$(hex_to_uuid "$h")"
             log "[worker $id] attempt=$i  last=$uuid"
         fi
@@ -147,21 +196,25 @@ worker() {
             fi
             break
         fi
+
+        losetup -d "$dev" 2>/dev/null || true
     done
+
+    losetup -d "$dev" 2>/dev/null || true
 }
 
-# ---------- Heartbeat ----------
+# ---------------- Heartbeat ----------------
 heartbeat() {
     local start=$SECONDS
-    while ! claimed; do
-        sleep 5
+    while [ "$KEEP_RUNNING" -eq 1 ] && ! claimed; do
+        sleep "$HEARTBEAT_EVERY"
         local n
-        n="$(ps -eo cmd= | grep -c '[m]kfs.btrfs' || true)"
+        n="$(pgrep -c -x mkfs.btrfs 2>/dev/null || echo 0)"
         log "[heartbeat] elapsed=$((SECONDS-start))s  active_mkfs=$n  workers=$WORKERS"
     done
 }
 
-# ---------- Run ----------
+# ---------------- Launch ----------------
 pids=()
 for ((i=1; i<=WORKERS; i++)); do
     worker "$i" &
@@ -171,22 +224,28 @@ done
 heartbeat &
 HB_PID=$!
 
-# Wait for a winner
-while ! claimed; do sleep 0.2; done
+# Wait for a winner (or Ctrl+C).
+while [ "$KEEP_RUNNING" -eq 1 ] && ! claimed; do
+    sleep 0.2
+done
 
+# Stop heartbeat + workers.
 kill "$HB_PID" 2>/dev/null || true
 for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
 wait 2>/dev/null || true
 
+# Prevent cleanup from running during normal shutdown.
+KEEP_RUNNING=0
+
 WIN_IMG="$(cat "$WIN_PATH" 2>/dev/null || true)"
 [ -n "$WIN_IMG" ] && [ -f "$WIN_IMG" ] || { log "no winner"; exit 1; }
 
-# Detach loop devices
-while read -r d; do
+# Detach any loops still hanging on our scratch images.
+while IFS=: read -r d _; do
     [ -n "$d" ] && losetup -d "$d" 2>/dev/null || true
-done < <(losetup -j "$WORKDIR"/*.img 2>/dev/null | cut -d: -f1)
+done < <(losetup -a 2>/dev/null | grep "$WORKDIR" || true)
 
-# ---------- Write to real device ----------
+# ---------------- Write to real device ----------------
 log ""
 log ">>> Writing winner to $REAL_DEV ..."
 dd if="$WIN_IMG" of="$REAL_DEV" bs=4M conv=fsync status=progress
@@ -203,3 +262,6 @@ if [ "$REAL_BYTES" -gt "$IMG_BYTES" ]; then
     log "Note: real device is larger than the written image."
     log "Run:  mount $REAL_DEV /mnt && btrfs filesystem resize max /mnt && umount /mnt"
 fi
+
+log ""
+log ">>> All done."
