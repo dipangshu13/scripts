@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# btrfs-uuid-sub-bruteforce.sh
+# btrfs-uuid-sub-bruteforce-dm.sh
 set -euo pipefail
 
 # ---------------- Config ----------------
@@ -20,18 +20,17 @@ SB_UUID_SUB_OFF=$((SB_OFF + 0x40))
 
 # ---------------- Sanity ----------------
 [ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
-for c in mkfs.btrfs losetup dd od blkid truncate grep; do
+for c in mkfs.btrfs dmsetup dd od blkid truncate grep; do
     command -v "$c" >/dev/null || { echo "missing: $c" >&2; exit 1; }
 done
 [ -b "$REAL_DEV" ] || { echo "not a block device: $REAL_DEV" >&2; exit 1; }
 
 mkdir -p "$WORKDIR"
-
 log() { printf '%s\n' "$*" >&2; }
 
 # ---------------- Cleanup ----------------
 KEEP_RUNNING=1
-declare -a ALLOCATED_LOOPS=()
+declare -a DM_NAMES=()
 
 cleanup() {
     trap - INT TERM EXIT
@@ -40,8 +39,8 @@ cleanup() {
     echo ">>> Shutting down..." >&2
     jobs -p 2>/dev/null | xargs -r kill -9 2>/dev/null || true
     pkill -9 -f "btrfs-uuid-bf" 2>/dev/null || true
-    for d in "${ALLOCATED_LOOPS[@]:-}"; do
-        [ -n "$d" ] && losetup -d "$d" 2>/dev/null || true
+    for n in "${DM_NAMES[@]:-}"; do
+        [ -n "$n" ] && dmsetup remove "$n" 2>/dev/null || true
     done
     echo ">>> Done." >&2
     exit 130
@@ -76,7 +75,7 @@ WIN_PATH="$WORKDIR/.win.path"
 rm -rf "$WIN_LOCK" "$WIN_PATH"
 claimed() { [ -d "$WIN_LOCK" ]; }
 
-# ---------------- Preflight ----------------
+# ---------------- Preflight: allocate DM devices ----------------
 log "=== Pre-flight ==="
 log "target : $REAL_DEV"
 log "size   : $SIZE"
@@ -84,26 +83,40 @@ log "workers: $WORKERS"
 log "scratch: $WORKDIR"
 log ""
 
-log "Allocating $WORKERS persistent loop devices..."
+declare -a DM_DEVS=()
+declare -a DM_FILES=()
+
+log "Allocating $WORKERS device-mapper volumes..."
 for ((i=1; i<=WORKERS; i++)); do
     img="$WORKDIR/bf_$i.img"
+    name="bfu$i"
+
     truncate -s "$SIZE" "$img"
-    dev="$(losetup -f --show "$img" 2>/dev/null)" || {
-        log "ERROR: could not allocate loop device #$i"
-        cleanup
-    }
-    ALLOCATED_LOOPS[$i]="$dev"
+    DM_FILES[$i]="$img"
+
+    sectors=$(( $(stat -c%s "$img") / 512 ))
+    echo "0 $sectors linear $img 0" | dmsetup create "$name"
+
+    DM_NAMES+=("$name")
+    DM_DEVS[$i]="/dev/mapper/$name"
 done
-log "Allocated: ${ALLOCATED_LOOPS[*]}"
+log "Allocated: ${DM_DEVS[*]}"
+log ""
+
+# Quick verify: mkfs once on one DM device
+if ! mkfs.btrfs -f -q "${DM_DEVS[1]}" -L "$LABEL" -U "$MAIN_UUID" 2>/dev/null; then
+    log "ERROR: mkfs.btrfs failed on ${DM_DEVS[1]}"
+    cleanup
+fi
+log "mkfs on ${DM_DEVS[1]} OK. Starting workers..."
 log ""
 
 # ---------------- Worker ----------------
 worker() {
     local id="$1"
-    local dev="${ALLOCATED_LOOPS[$id]}"
-    local img="$WORKDIR/bf_$id.img"
+    local dev="${DM_DEVS[$id]}"
+    local img="${DM_FILES[$id]}"
 
-    # Note: NO losetup in the hot loop. Device stays attached forever.
     local i=0 h uuid fail=0
     while [ "$KEEP_RUNNING" -eq 1 ] && ! claimed; do
         i=$((i+1))
@@ -115,7 +128,7 @@ worker() {
                 log "[worker $id] mkfs failed (attempt $i, fail #$fail):"
                 sed 's/^/    /' "$WORKDIR/mkfs.err.$id" >&2
             fi
-            sleep 0.1
+            sleep 0.2
             continue
         fi
         rm -f "$WORKDIR/mkfs.err.$id"
@@ -170,11 +183,11 @@ wait 2>/dev/null || true
 KEEP_RUNNING=0
 
 WIN_IMG="$(cat "$WIN_PATH" 2>/dev/null || true)"
-[ -n "$WIN_IMG" ] && [ -f "$WIN_IMG" ] || { log "no winner"; exit 1; }
+[ -n "$WIN_IMG" ] && [ -f "$WIN_IMG" ] || { log "no winner"; cleanup; }
 
-# Detach all loops now (only at the end).
-for d in "${ALLOCATED_LOOPS[@]}"; do
-    losetup -d "$d" 2>/dev/null || true
+# Remove DM devices
+for n in "${DM_NAMES[@]}"; do
+    dmsetup remove "$n" 2>/dev/null || true
 done
 
 # ---------------- Write to real device ----------------
@@ -191,8 +204,7 @@ REAL_BYTES=$(blockdev --getsize64 "$REAL_DEV" 2>/dev/null || echo 0)
 IMG_BYTES=$(stat -c%s "$WIN_IMG" 2>/dev/null || echo 0)
 if [ "$REAL_BYTES" -gt "$IMG_BYTES" ]; then
     log ""
-    log "Note: resize after mounting:"
-    log "  mount $REAL_DEV /mnt && btrfs filesystem resize max /mnt && umount /mnt"
+    log "Resize: mount $REAL_DEV /mnt && btrfs filesystem resize max /mnt && umount /mnt"
 fi
 
 log ""
